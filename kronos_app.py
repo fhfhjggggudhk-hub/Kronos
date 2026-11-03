@@ -1,5 +1,5 @@
-"""Kronos forecast app. Put this file in the ROOT of your Kronos fork
-(next to the `model` folder) and deploy it on Streamlit."""
+"""Kronos forecast app v2 - stable results, direction verdict, optional backtest.
+Put this file in the ROOT of your Kronos fork (next to the `model` folder)."""
 import os
 import sys
 
@@ -12,6 +12,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
+import torch
 import yfinance as yf
 
 st.set_page_config(page_title="Kronos Forecast", layout="wide")
@@ -52,7 +53,7 @@ def to_weekly(d):
     ).dropna()
 
 
-def run_forecast(pred, x, tf, n, runs):
+def run_forecast(pred, x, tf, n, runs, temp, seed, show_bar=True):
     x = x.tail(400)
     xdf = pd.DataFrame({
         "open": x.Open.values, "high": x.High.values, "low": x.Low.values,
@@ -64,14 +65,51 @@ def run_forecast(pred, x, tf, n, runs):
     fut = pd.bdate_range(start, periods=n) if tf == "Daily" else pd.date_range(start, periods=n, freq="W-FRI")
     yts = pd.Series(fut)
     outs = []
-    bar = st.progress(0.0, text="Running Kronos...")
+    bar = st.progress(0.0, text="Running Kronos...") if show_bar else None
     for i in range(runs):
+        torch.manual_seed(seed + i)  # fixed seeds -> same stock gives same result every time
+        np.random.seed(seed + i)
         p = pred.predict(df=xdf, x_timestamp=xts, y_timestamp=yts, pred_len=n,
-                         T=1.0, top_p=0.9, sample_count=1)
+                         T=temp, top_p=0.9, sample_count=1)
         outs.append(p[["open", "high", "low", "close"]].values.astype(float))
-        bar.progress((i + 1) / runs, text=f"Run {i + 1}/{runs}")
+        if bar:
+            bar.progress((i + 1) / runs, text=f"Run {i + 1}/{runs}")
+    if bar:
+        bar.empty()
+    return fut, np.stack(outs)  # runs x n x 4 (O,H,L,C)
+
+
+def verdict(p):
+    if p >= 0.70:
+        return "Strong UP bias", "success"
+    if p >= 0.55:
+        return "Mild UP bias", "success"
+    if p > 0.45:
+        return "No clear direction", "warning"
+    if p > 0.30:
+        return "Mild DOWN bias", "error"
+    return "Strong DOWN bias", "error"
+
+
+def backtest(pred, x, tf, steps, runs, temp, seed):
+    rows = []
+    bar = st.progress(0.0, text="Backtest running...")
+    for k, i in enumerate(range(len(x) - steps - 1, len(x) - 1)):
+        ctx = x.iloc[: i + 1]
+        _, arr = run_forecast(pred, ctx, tf, 1, runs, temp, seed, show_bar=False)
+        prob = float((arr[:, 0, 3] > ctx.Close.iat[-1]).mean())
+        actual_up = bool(x.Close.iat[i + 1] > ctx.Close.iat[-1])
+        rows.append({
+            "Candle": x.index[i + 1].date(),
+            "Model up-runs %": round(prob * 100),
+            "Model says": "Up" if prob > 0.5 else "Down",
+            "Actual": "Up" if actual_up else "Down",
+            "Correct": (prob > 0.5) == actual_up,
+            "Confident": prob >= 0.65 or prob <= 0.35,
+        })
+        bar.progress((k + 1) / steps, text=f"Backtest {k + 1}/{steps}")
     bar.empty()
-    return fut, np.stack(outs)  # shape: runs x n x 4 (O,H,L,C)
+    return pd.DataFrame(rows)
 
 
 def draw(x, fut, arr, n_hist=60):
@@ -106,15 +144,19 @@ def draw(x, fut, arr, n_hist=60):
 
 
 # ------------------------------------------------------------------ UI
-st.title("Kronos - next candle forecast")
+st.title("Kronos - direction forecast")
 
 with st.sidebar:
     exch = st.radio("Exchange", ["NSE", "BSE"], horizontal=True)
     tf = st.radio("Timeframe", ["Daily", "Weekly"], horizontal=True)
     model_key = st.selectbox("Model", list(MODELS))
-    n = st.slider("Candles to forecast", 1, 20, 5 if tf == "Daily" else 4)
-    runs = st.slider("Number of runs (more = steadier, slower)", 1, 20, 5)
+    n = st.slider("Candles to forecast", 1, 20, 3)
+    runs = st.slider("Number of runs (more = steadier, slower)", 5, 50, 20)
+    temp = st.slider("Randomness (lower = steadier)", 0.3, 1.0, 0.6, 0.1)
+    seed = st.number_input("Seed (same seed = same result)", 0, 99999, 42)
     complete_only = st.checkbox("Ignore running (incomplete) candle", value=True)
+    do_bt = st.checkbox("Also run backtest (slow)", value=False)
+    bt_steps = st.slider("Backtest candles", 5, 30, 12, disabled=not do_bt)
 
 name = st.text_input("Stock name (NSE: RELIANCE | BSE: scrip code like 500325)", "RELIANCE").strip().upper()
 go = st.button("Forecast", type="primary")
@@ -142,22 +184,47 @@ if go and name:
         st.stop()
 
     pred = load_predictor(model_key)
-    fut, arr = run_forecast(pred, x, tf, n, runs)
+    fut, arr = run_forecast(pred, x, tf, n, runs, temp, int(seed))
 
     last_close = float(x.Close.iat[-1])
-    mean = arr.mean(axis=0)
-    c1 = float(mean[0, 3])
-    up1 = float((arr[:, 0, 3] > last_close).mean() * 100)
+    nxt = arr[:, 0, 3]
+    fin = arr[:, -1, 3]
+    p_next = float((nxt > last_close).mean())
+    p_fin = float((fin > last_close).mean())
+    chg_next = (np.median(nxt) / last_close - 1) * 100
+    chg_fin = (np.median(fin) / last_close - 1) * 100
+
+    # stability: split the runs in two halves and compare
+    half = len(nxt) // 2
+    pa = float((nxt[:half] > last_close).mean())
+    pb = float((nxt[half:] > last_close).mean())
+    stable = abs(pa - pb) <= 0.15
 
     st.subheader(f"{name} ({tf}) - last candle {x.index[-1].date()}, close {last_close:.2f}")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Next candle: forecast close", f"{c1:.2f}", f"{(c1 / last_close - 1) * 100:+.2f}%")
-    m2.metric(f"Runs with close above {last_close:.2f}", f"{up1:.0f}%")
-    m3.metric("Final candle: forecast close", f"{mean[-1, 3]:.2f}",
-              f"{(mean[-1, 3] / last_close - 1) * 100:+.2f}%")
+
+    text, kind = verdict(p_next)
+    getattr(st, kind)(
+        f"**{text}** - {p_next * 100:.0f}% of {runs} runs close the next candle above {last_close:.2f}"
+    )
+    if stable:
+        st.caption(f"Stability OK: the two halves of the runs agree ({pa * 100:.0f}% vs {pb * 100:.0f}%).")
+    else:
+        st.warning(
+            f"Unstable: the two halves of the runs disagree ({pa * 100:.0f}% vs {pb * 100:.0f}%). "
+            "Increase the number of runs or treat this as no signal."
+        )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Next candle: median close", f"{np.median(nxt):.2f}", f"{chg_next:+.2f}%")
+    c2.metric(f"After {n} candle(s): median close", f"{np.median(fin):.2f}", f"{chg_fin:+.2f}%")
+    c3.metric(f"Runs above last close after {n}", f"{p_fin * 100:.0f}%")
+    st.write(
+        f"Next-candle close range (10-90%): {np.percentile(nxt, 10):.2f} to {np.percentile(nxt, 90):.2f}"
+    )
 
     st.pyplot(draw(x, fut, arr))
 
+    mean = arr.mean(axis=0)
     rows = []
     for i in range(len(fut)):
         rows.append({
@@ -169,8 +236,25 @@ if go and name:
             "Close above last close %": round(float((arr[:, i, 3] > last_close).mean() * 100)),
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    if do_bt:
+        st.subheader("Backtest - how often was the model right on this stock?")
+        bt_runs = max(7, min(runs, 10))
+        bt = backtest(pred, x, tf, int(bt_steps), bt_runs, temp, int(seed))
+        acc = bt.Correct.mean() * 100
+        base = (bt.Actual == "Up").mean() * 100
+        conf = bt[bt.Confident]
+        b1, b2, b3 = st.columns(3)
+        b1.metric("Model direction accuracy", f"{acc:.0f}%")
+        b2.metric("Candles that actually went up", f"{base:.0f}%")
+        b3.metric("Accuracy when confident", f"{conf.Correct.mean() * 100:.0f}% ({len(conf)})" if len(conf) else "n/a")
+        st.dataframe(bt, use_container_width=True, hide_index=True)
+        st.caption(
+            "Compare accuracy with the 'went up' share: if the market went up 60% of the time, "
+            "always guessing Up already gives 60%. A small sample proves nothing by itself."
+        )
+
     st.caption(
-        "Faded candles = average of all runs. The percentages show how many runs agreed, "
-        "not a real probability. This is an estimate from a model, not advice or a guarantee. "
-        "Daily forecast dates skip weekends only, not market holidays."
+        "Percentages show how many runs agreed, not a real probability. This is a model estimate, "
+        "not advice or a guarantee. Daily forecast dates skip weekends only, not market holidays."
     )
