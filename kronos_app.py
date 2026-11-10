@@ -2,6 +2,7 @@
 এই ফাইলটা Kronos Fork-এর মূল ফোল্ডারে (model ফোল্ডারের পাশে) kronos_app.py নামে রাখুন।"""
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -115,7 +116,8 @@ with st.sidebar:
     tf = st.radio("টাইমফ্রেম", ["Weekly", "Daily"], horizontal=True)
     model_key = st.selectbox("মডেল", list(MODELS))
     runs = st.slider("কতবার অনুমান (প্রতি পরীক্ষায়)", 10, 40, 20)
-    temp = st.slider("Randomness (কম = বেশি স্থির)", 0.3, 1.0, 0.6, 0.1)
+    temp = st.slider("Randomness (১.০ = স্বাভাবিক, কম করলে সবাই একমত হওয়া সহজ হয়)", 0.3, 1.0, 1.0, 0.1)
+    fresh = st.checkbox("প্রতিবার নতুন র‍্যান্ডম (প্রতিবার আলাদা ফল)", value=True)
     complete_only = st.checkbox("চলমান অসম্পূর্ণ ক্যান্ডেল বাদ দিন", value=True)
 
 name = st.text_input("স্টকের নাম (NSE: RELIANCE | BSE: স্ক্রিপ কোড যেমন 500325)", "RELIANCE").strip().upper()
@@ -144,8 +146,10 @@ if go and name:
         st.stop()
 
     pred = load_predictor(model_key)
-    fut, arrA = run_many(pred, x, tf, runs, temp, SEED_A, "পরীক্ষা ১")
-    _, arrB = run_many(pred, x, tf, runs, temp, SEED_B, "পরীক্ষা ২")
+    base = int(time.time()) % 1_000_000 if fresh else SEED_A
+    seedA, seedB = (base, base + 5000) if fresh else (SEED_A, SEED_B)
+    fut, arrA = run_many(pred, x, tf, runs, temp, seedA, "পরীক্ষা ১")
+    _, arrB = run_many(pred, x, tf, runs, temp, seedB, "পরীক্ষা ২")
 
     last_close = float(x.Close.iat[-1])
     upA = int((arrA[:, 3] > last_close).sum())
@@ -175,12 +179,28 @@ if go and name:
         st.error(f"নিচের ঝোঁক স্পষ্ট: মাত্র {p * 100:.0f}% বার ওপরে।")
 
     med = float(np.median(allarr[:, 3]))
+    lim = 12 if tf == "Weekly" else 6
+    if abs(med / last_close - 1) * 100 > lim:
+        st.warning(
+            f"সতর্কতা: অনুমানিত বদল ({(med / last_close - 1) * 100:+.1f}%) এক ক্যান্ডেলের জন্য অস্বাভাবিক বড়। "
+            "এ ধরনের ফলে ভরসা কম রাখুন।"
+        )
     st.write(
         f"অনুমানের মাঝামাঝি Close: **{med:.2f}** ({(med / last_close - 1) * 100:+.2f}%)। "
         f"বেশিরভাগ অনুমান ছিল {np.percentile(allarr[:, 3], 10):.2f} থেকে {np.percentile(allarr[:, 3], 90):.2f}-এর মধ্যে।"
     )
 
     st.pyplot(draw(x, fut, allarr))
+
+    with st.expander("প্রতিটা অনুমান আলাদা আলাদা দেখুন"):
+        t = pd.DataFrame({
+            "পরীক্ষা ১ Close": arrA[:, 3].round(2),
+            "পরীক্ষা ১ বদল %": ((arrA[:, 3] / last_close - 1) * 100).round(1),
+            "পরীক্ষা ২ Close": arrB[:, 3].round(2),
+            "পরীক্ষা ২ বদল %": ((arrB[:, 3] / last_close - 1) * 100).round(1),
+        })
+        t.index = range(1, len(t) + 1)
+        st.dataframe(t, use_container_width=True)
 
     m = allarr.mean(axis=0)
     st.dataframe(
