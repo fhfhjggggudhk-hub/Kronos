@@ -1,8 +1,7 @@
-"""Kronos simple app v3 - একটা ক্যান্ডেল, ২০ বার অনুমান, দুইবার যাচাই।
-এই ফাইলটা Kronos Fork-এর মূল ফোল্ডারে (model ফোল্ডারের পাশে) kronos_app.py নামে রাখুন।"""
+"""Kronos forecast app. Put this file in the ROOT of your Kronos fork
+(next to the `model` folder) and deploy it on Streamlit."""
 import os
 import sys
-import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -13,20 +12,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-import torch
 import yfinance as yf
 
-st.set_page_config(page_title="Kronos পরের ক্যান্ডেল", layout="wide")
+st.set_page_config(page_title="Kronos Forecast", layout="wide")
 
 IST = "Asia/Kolkata"
 MODELS = {
-    "Kronos-mini (হালকা, দ্রুত)": ("NeoQuasar/Kronos-Tokenizer-2k", "NeoQuasar/Kronos-mini", 2048),
-    "Kronos-small (একটু ভালো, ভারী)": ("NeoQuasar/Kronos-Tokenizer-base", "NeoQuasar/Kronos-small", 512),
+    "Kronos-mini (fast, light)": ("NeoQuasar/Kronos-Tokenizer-2k", "NeoQuasar/Kronos-mini", 2048),
+    "Kronos-small (better, heavier)": ("NeoQuasar/Kronos-Tokenizer-base", "NeoQuasar/Kronos-small", 512),
 }
-SEED_A, SEED_B = 42, 1042
 
 
-@st.cache_resource(show_spinner="Kronos মডেল লোড হচ্ছে (প্রথমবার সময় লাগবে)...")
+@st.cache_resource(show_spinner="Loading Kronos model (first time takes a while)...")
 def load_predictor(key):
     from model import Kronos, KronosPredictor, KronosTokenizer
 
@@ -55,8 +52,7 @@ def to_weekly(d):
     ).dropna()
 
 
-def run_many(pred, x, tf, runs, temp, seed, label):
-    """পরের ১টা ক্যান্ডেলের জন্য `runs` বার অনুমান। ফল: runs x 4 (O,H,L,C)"""
+def run_forecast(pred, x, tf, n, runs):
     x = x.tail(400)
     xdf = pd.DataFrame({
         "open": x.Open.values, "high": x.High.values, "low": x.Low.values,
@@ -65,62 +61,62 @@ def run_many(pred, x, tf, runs, temp, seed, label):
     })
     xts = pd.Series(x.index)
     start = x.index[-1] + pd.Timedelta(days=1)
-    fut = pd.bdate_range(start, periods=1) if tf == "Daily" else pd.date_range(start, periods=1, freq="W-FRI")
+    fut = pd.bdate_range(start, periods=n) if tf == "Daily" else pd.date_range(start, periods=n, freq="W-FRI")
     yts = pd.Series(fut)
     outs = []
-    bar = st.progress(0.0, text=label)
+    bar = st.progress(0.0, text="Running Kronos...")
     for i in range(runs):
-        torch.manual_seed(seed + i)
-        np.random.seed(seed + i)
-        p = pred.predict(df=xdf, x_timestamp=xts, y_timestamp=yts, pred_len=1,
-                         T=temp, top_p=0.9, sample_count=1)
-        outs.append(p[["open", "high", "low", "close"]].values[0].astype(float))
-        bar.progress((i + 1) / runs, text=f"{label} ({i + 1}/{runs})")
+        p = pred.predict(df=xdf, x_timestamp=xts, y_timestamp=yts, pred_len=n,
+                         T=1.0, top_p=0.9, sample_count=1)
+        outs.append(p[["open", "high", "low", "close"]].values.astype(float))
+        bar.progress((i + 1) / runs, text=f"Run {i + 1}/{runs}")
     bar.empty()
-    return fut, np.array(outs)
+    return fut, np.stack(outs)  # shape: runs x n x 4 (O,H,L,C)
 
 
-def draw(x, fut, arr, n_hist=40):
+def draw(x, fut, arr, n_hist=60):
+    n = len(fut)
     mean = arr.mean(axis=0)
-    lo, hi = np.percentile(arr[:, 3], 10), np.percentile(arr[:, 3], 90)
+    lo = np.percentile(arr[:, :, 3], 10, axis=0)
+    hi = np.percentile(arr[:, :, 3], 90, axis=0)
     h = x.tail(n_hist)
     fig, ax = plt.subplots(figsize=(11, 5))
 
-    def candle(xp, o, hh, l, c, alpha):
-        col = "#16a34a" if c >= o else "#dc2626"
-        ax.plot([xp, xp], [l, hh], color=col, lw=1, alpha=alpha)
-        ax.add_patch(plt.Rectangle((xp - 0.3, min(o, c)), 0.6, max(abs(c - o), 1e-9), color=col, alpha=alpha))
+    def candles(xs, O, H, L, C, alpha):
+        for i in range(len(xs)):
+            col = "#16a34a" if C[i] >= O[i] else "#dc2626"
+            ax.plot([xs[i], xs[i]], [L[i], H[i]], color=col, lw=1, alpha=alpha)
+            ax.add_patch(plt.Rectangle((xs[i] - 0.3, min(O[i], C[i])), 0.6,
+                                       max(abs(C[i] - O[i]), 1e-9), color=col, alpha=alpha))
 
-    for i, (o, hh, l, c) in enumerate(zip(h.Open, h.High, h.Low, h.Close)):
-        candle(i, o, hh, l, c, 1.0)
-    xf = len(h)
-    candle(xf, mean[0], mean[1], mean[2], mean[3], 0.5)
-    ax.fill_between([xf - 0.4, xf + 0.4], lo, hi, color="#2563eb", alpha=0.2, label="২০ অনুমানের Close (১০%–৯০%)")
+    xs_h = np.arange(len(h))
+    xs_f = np.arange(len(h), len(h) + n)
+    candles(xs_h, h.Open.values, h.High.values, h.Low.values, h.Close.values, 1.0)
+    candles(xs_f, mean[:, 0], mean[:, 1], mean[:, 2], mean[:, 3], 0.55)
+    ax.fill_between(xs_f, lo, hi, color="#2563eb", alpha=0.18, label="Forecast close: 10-90% range")
     ax.axvline(len(h) - 0.5, ls="--", color="gray")
     dates = list(h.index) + list(fut)
-    ticks = np.linspace(0, len(dates) - 1, 6).astype(int)
+    ticks = np.linspace(0, len(dates) - 1, 7).astype(int)
     ax.set_xticks(ticks)
     ax.set_xticklabels([dates[i].strftime("%d %b %y") for i in ticks], fontsize=8)
     ax.grid(alpha=0.2)
     ax.legend(loc="upper left", fontsize=8)
-    ax.set_xlim(-1, len(h) + 1)
+    ax.set_xlim(-1, len(h) + n)
     return fig
 
 
 # ------------------------------------------------------------------ UI
-st.title("Kronos - পরের ক্যান্ডেল কোন দিকে?")
-st.caption("এক ক্যান্ডেলের জন্য মডেল অনেকবার অনুমান করে। কতবার ওপরে বলল সেটা গুনে দেখায়। এটা আন্দাজ, নিশ্চিত নয়।")
+st.title("Kronos - next candle forecast")
 
 with st.sidebar:
-    exch = st.radio("এক্সচেঞ্জ", ["NSE", "BSE"], horizontal=True)
-    tf = st.radio("টাইমফ্রেম", ["Weekly", "Daily"], horizontal=True)
-    model_key = st.selectbox("মডেল", list(MODELS))
-    runs = st.slider("কতবার অনুমান (প্রতি পরীক্ষায়)", 10, 40, 20)
-    temp = st.slider("Randomness (১.০ = স্বাভাবিক, কম করলে সবাই একমত হওয়া সহজ হয়)", 0.3, 1.0, 1.0, 0.1)
-    fresh = st.checkbox("প্রতিবার নতুন র‍্যান্ডম (প্রতিবার আলাদা ফল)", value=True)
-    complete_only = st.checkbox("চলমান অসম্পূর্ণ ক্যান্ডেল বাদ দিন", value=True)
+    exch = st.radio("Exchange", ["NSE", "BSE"], horizontal=True)
+    tf = st.radio("Timeframe", ["Daily", "Weekly"], horizontal=True)
+    model_key = st.selectbox("Model", list(MODELS))
+    n = st.slider("Candles to forecast", 1, 20, 5 if tf == "Daily" else 4)
+    runs = st.slider("Number of runs (more = steadier, slower)", 1, 20, 5)
+    complete_only = st.checkbox("Ignore running (incomplete) candle", value=True)
 
-name = st.text_input("স্টকের নাম (NSE: RELIANCE | BSE: স্ক্রিপ কোড যেমন 500325)", "RELIANCE").strip().upper()
+name = st.text_input("Stock name (NSE: RELIANCE | BSE: scrip code like 500325)", "RELIANCE").strip().upper()
 go = st.button("Forecast", type="primary")
 
 if go and name:
@@ -128,10 +124,10 @@ if go and name:
     try:
         daily = get_daily(ticker)
     except Exception as e:
-        st.error(f"{ticker}-এর ডেটা আনা যায়নি: {e}")
+        st.error(f"Could not download data for {ticker}: {e}")
         st.stop()
     if len(daily) < 150:
-        st.error(f"{ticker}-এর ডেটা যথেষ্ট নেই। নাম বা এক্সচেঞ্জ ঠিক আছে কি না দেখুন।")
+        st.error(f"Not enough data for {ticker}. Check the stock name / exchange.")
         st.stop()
 
     x = daily if tf == "Daily" else to_weekly(daily)
@@ -142,73 +138,39 @@ if go and name:
     if complete_only and (last > today or (last == today and mkt_open)):
         x = x.iloc[:-1]
     if len(x) < 100:
-        st.error("ক্যান্ডেল যথেষ্ট নেই।")
+        st.error("Not enough candles for this timeframe.")
         st.stop()
 
     pred = load_predictor(model_key)
-    base = int(time.time()) % 1_000_000 if fresh else SEED_A
-    seedA, seedB = (base, base + 5000) if fresh else (SEED_A, SEED_B)
-    fut, arrA = run_many(pred, x, tf, runs, temp, seedA, "পরীক্ষা ১")
-    _, arrB = run_many(pred, x, tf, runs, temp, seedB, "পরীক্ষা ২")
+    fut, arr = run_forecast(pred, x, tf, n, runs)
 
     last_close = float(x.Close.iat[-1])
-    upA = int((arrA[:, 3] > last_close).sum())
-    upB = int((arrB[:, 3] > last_close).sum())
-    pA, pB = upA / runs, upB / runs
-    allarr = np.vstack([arrA, arrB])
-    p = (upA + upB) / (2 * runs)
-    agree = abs(pA - pB) <= 0.20
+    mean = arr.mean(axis=0)
+    c1 = float(mean[0, 3])
+    up1 = float((arr[:, 0, 3] > last_close).mean() * 100)
 
-    st.subheader(f"{name} ({'সাপ্তাহিক' if tf == 'Weekly' else 'দৈনিক'}) - শেষ ক্যান্ডেল {x.index[-1].date()}, Close {last_close:.2f}")
+    st.subheader(f"{name} ({tf}) - last candle {x.index[-1].date()}, close {last_close:.2f}")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Next candle: forecast close", f"{c1:.2f}", f"{(c1 / last_close - 1) * 100:+.2f}%")
+    m2.metric(f"Runs with close above {last_close:.2f}", f"{up1:.0f}%")
+    m3.metric("Final candle: forecast close", f"{mean[-1, 3]:.2f}",
+              f"{(mean[-1, 3] / last_close - 1) * 100:+.2f}%")
 
-    c1, c2 = st.columns(2)
-    c1.metric("পরীক্ষা ১: কতবার ওপরে", f"{upA} / {runs}")
-    c2.metric("পরীক্ষা ২: কতবার ওপরে", f"{upB} / {runs}")
+    st.pyplot(draw(x, fut, arr))
 
-    if not agree:
-        st.warning("দুই পরীক্ষার ফল মেলেনি। এই সংকেত ধরবেন না (মডেল নিজেই নিশ্চিত নয়)।")
-    elif p >= 0.75:
-        st.success(f"ওপরের ঝোঁক স্পষ্ট: মোট {2 * runs} বারের {upA + upB} বার ওপরে ({p * 100:.0f}%)।")
-    elif p >= 0.60:
-        st.success(f"সামান্য ওপরের ঝোঁক: {p * 100:.0f}% বার ওপরে।")
-    elif p > 0.40:
-        st.info(f"কোনো স্পষ্ট ঝোঁক নেই ({p * 100:.0f}% বার ওপরে)। এই স্টকে ট্রেড ভাববেন না।")
-    elif p > 0.25:
-        st.error(f"সামান্য নিচের ঝোঁক: মাত্র {p * 100:.0f}% বার ওপরে।")
-    else:
-        st.error(f"নিচের ঝোঁক স্পষ্ট: মাত্র {p * 100:.0f}% বার ওপরে।")
-
-    med = float(np.median(allarr[:, 3]))
-    lim = 12 if tf == "Weekly" else 6
-    if abs(med / last_close - 1) * 100 > lim:
-        st.warning(
-            f"সতর্কতা: অনুমানিত বদল ({(med / last_close - 1) * 100:+.1f}%) এক ক্যান্ডেলের জন্য অস্বাভাবিক বড়। "
-            "এ ধরনের ফলে ভরসা কম রাখুন।"
-        )
-    st.write(
-        f"অনুমানের মাঝামাঝি Close: **{med:.2f}** ({(med / last_close - 1) * 100:+.2f}%)। "
-        f"বেশিরভাগ অনুমান ছিল {np.percentile(allarr[:, 3], 10):.2f} থেকে {np.percentile(allarr[:, 3], 90):.2f}-এর মধ্যে।"
-    )
-
-    st.pyplot(draw(x, fut, allarr))
-
-    with st.expander("প্রতিটা অনুমান আলাদা আলাদা দেখুন"):
-        t = pd.DataFrame({
-            "পরীক্ষা ১ Close": arrA[:, 3].round(2),
-            "পরীক্ষা ১ বদল %": ((arrA[:, 3] / last_close - 1) * 100).round(1),
-            "পরীক্ষা ২ Close": arrB[:, 3].round(2),
-            "পরীক্ষা ২ বদল %": ((arrB[:, 3] / last_close - 1) * 100).round(1),
+    rows = []
+    for i in range(len(fut)):
+        rows.append({
+            "Date": fut[i].date(),
+            "Open": round(mean[i, 0], 2), "High": round(mean[i, 1], 2),
+            "Low": round(mean[i, 2], 2), "Close": round(mean[i, 3], 2),
+            "Change vs last close %": round((mean[i, 3] / last_close - 1) * 100, 2),
+            "Green-candle runs %": round(float((arr[:, i, 3] > arr[:, i, 0]).mean() * 100)),
+            "Close above last close %": round(float((arr[:, i, 3] > last_close).mean() * 100)),
         })
-        t.index = range(1, len(t) + 1)
-        st.dataframe(t, use_container_width=True)
-
-    m = allarr.mean(axis=0)
-    st.dataframe(
-        pd.DataFrame([{"তারিখ": fut[0].date(), "Open": round(m[0], 2), "High": round(m[1], 2),
-                       "Low": round(m[2], 2), "Close": round(m[3], 2)}]),
-        use_container_width=True, hide_index=True,
-    )
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     st.caption(
-        "মনে রাখবেন: 'কতবার ওপরে' মানে মডেলের নিজেদের মধ্যে মিল, বাজারের গ্যারান্টি নয়। "
-        "সাপোর্টে প্যাটার্নের সাথে মিলিয়ে দেখুন আর স্টপ-লস রাখুন।"
+        "Faded candles = average of all runs. The percentages show how many runs agreed, "
+        "not a real probability. This is an estimate from a model, not advice or a guarantee. "
+        "Daily forecast dates skip weekends only, not market holidays."
     )
